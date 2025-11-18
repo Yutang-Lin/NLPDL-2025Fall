@@ -1,7 +1,6 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from typing import Optional, List, Tuple
 from einops import einsum, rearrange
@@ -26,7 +25,14 @@ class Linear(nn.Module):
             device (torch.device, optional): Device to store parameters. Defaults to None.
             dtype (torch.dtype, optional): Data type of parameters. Defaults to None.
         """
-        ...
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.randn(out_features, in_features, device=device, dtype=dtype))
+        if bias:
+            self.bias = nn.Parameter(torch.randn(out_features, device=device, dtype=dtype))
+        else:
+            self.register_parameter('bias', None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Applies the linear transformation.
@@ -37,7 +43,7 @@ class Linear(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (..., out_features).
         """
-        ...
+        return einsum(x, self.weight, "b ... i, j i -> b ... j") + (self.bias if self.bias is not None else 0)
 
 
 class Embedding(nn.Module):
@@ -58,7 +64,10 @@ class Embedding(nn.Module):
             device (torch.device, optional): Device to store parameters. Defaults to None.
             dtype (torch.dtype, optional): Data type of parameters. Defaults to None.
         """
-        ...
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight = nn.Parameter(torch.randn(num_embeddings, embedding_dim, device=device, dtype=dtype))
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Looks up embedding vectors for token IDs.
@@ -69,7 +78,7 @@ class Embedding(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (..., embedding_dim).
         """
-        ...
+        return self.weight[token_ids]
 
 class RMSNorm(nn.Module):
     """Applies Root Mean Square Layer Normalization (RMSNorm)."""  
@@ -89,7 +98,10 @@ class RMSNorm(nn.Module):
             device (torch.device, optional): Device to store parameters. Defaults to None.
             dtype (torch.dtype, optional): Data type of parameters. Defaults to None.
         """
-        ...
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Applies RMSNorm to the input.
@@ -100,7 +112,18 @@ class RMSNorm(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (..., d_model).
         """
-        ...
+        return (x * self.weight) / torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+
+def silu(x: torch.Tensor) -> torch.Tensor:
+    """SiLU activation function.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Output tensor.
+    """
+    return x * (1 / (1 + torch.exp(-x)))
 
 class SwiGLU(nn.Module):
     """Applies the SwiGLU feedforward transformation."""
@@ -120,7 +143,10 @@ class SwiGLU(nn.Module):
             device (torch.device, optional): Device to store parameters. Defaults to None.
             dtype (torch.dtype, optional): Data type of parameters. Defaults to None.
         """
-        ...
+        super().__init__()
+        self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.w3 = Linear(d_ff, d_model, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Applies the SwiGLU transformation.
@@ -131,7 +157,7 @@ class SwiGLU(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (..., d_model).
         """
-        ...
+        return self.w2(silu(self.w1(x)) * self.w3(x))
 
 class RoPE(nn.Module):
     """Applies Rotary Position Embeddings (RoPE)."""
@@ -151,7 +177,18 @@ class RoPE(nn.Module):
             max_seq_len (int): Maximum sequence length supported.
             device (torch.device, optional): Device to store buffers. Defaults to None.
         """
-        ...
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+
+        freqs = 1.0 / (theta ** (torch.arange(0, d_k, 2, device=device, dtype=torch.float32) / d_k))
+        positions = torch.arange(max_seq_len, device=device, dtype=torch.float32).unsqueeze(1)
+        angles = positions * freqs.unsqueeze(0)
+        self.register_buffer('cos_cached', torch.cos(angles))
+        self.register_buffer('sin_cached', torch.sin(angles))
+        self.cos_cached: torch.Tensor
+        self.sin_cached: torch.Tensor
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         """Applies rotary position embeddings.
@@ -164,7 +201,20 @@ class RoPE(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (..., seq_len, d_k).
         """
-        ...
+        cos = self.cos_cached[token_positions]
+        sin = self.sin_cached[token_positions]
+        
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        
+        rotated_x1 = x1 * cos - x2 * sin
+        rotated_x2 = x1 * sin + x2 * cos
+        
+        result = torch.zeros_like(x)
+        result[..., ::2] = rotated_x1
+        result[..., 1::2] = rotated_x2
+        
+        return result
 
 def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Softmax activation function.
@@ -178,7 +228,26 @@ def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Returns:
     Tensor with softmax applied along the specified dimension.
     """
-    ...
+    exp_x = torch.exp(x - x.max(dim=dim, keepdim=True)[0])
+    return exp_x / exp_x.sum(dim=dim, keepdim=True)
+
+def log_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Log-softmax activation function.
+    """
+    x = x - x.max(dim=dim, keepdim=True)[0]
+    return x - torch.log(torch.sum(torch.exp(x), dim=dim, keepdim=True))
+
+def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy loss function.
+
+    Args:
+        inputs (torch.Tensor): Input tensor of shape (..., vocab_size).
+        targets (torch.Tensor): Target tensor of shape (...,).
+
+    Returns:
+        torch.Tensor: Cross-entropy loss.
+    """
+    return -log_softmax(inputs, dim=-1).gather(dim=-1, index=targets.unsqueeze(-1)).squeeze().mean()
 
 def scaled_dot_product_attention(
     query: torch.Tensor,
@@ -197,7 +266,11 @@ def scaled_dot_product_attention(
     Returns:
         Tensor of shape (batch_size, ..., seq_len_q, d_v)
     """
-    ...
+    attn_score = einsum(query, key, "b ... q d_k, b ... k d_k -> b ... q k") / math.sqrt(query.shape[-1])
+    if mask is not None:
+        attn_score = attn_score.masked_fill(~mask, float('-inf'))
+    attn_prob = softmax(attn_score, dim=-1)
+    return einsum(attn_prob, value, "b ... q k, b ... k d_v -> b ... q d_v")
 
 class CasualMultiheadSelfAttention(nn.Module):
     """Causal multi-head self-attention with optional RoPE."""
