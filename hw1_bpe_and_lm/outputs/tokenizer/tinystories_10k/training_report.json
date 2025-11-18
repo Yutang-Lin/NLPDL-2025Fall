@@ -1,0 +1,22 @@
+{
+  "dataset": "/home/yutang/Desktop/PKUNLP/NLPDL-2025Fall/hw1_bpe_and_lm/data/TinyStoriesV2-GPT4-train.txt",
+  "vocab_size": 10000,
+  "num_merges": 9743,
+  "elapsed_seconds": 698.6969612249959,
+  "elapsed_hours": 0.19408248922916552,
+  "max_rss_gb": 0.07198715209960938,
+  "longest_token": {
+    "id": 7160,
+    "byte_length": 15,
+    "text": "Ġaccomplishment"
+  },
+  "bottleneck": {
+    "function": "wait (threading.py:637)",
+    "cumulative_seconds": 599.180887311
+  },
+  "phase_breakdown_seconds": {
+    "setup_seconds": 2.304099325556308e-05,
+    "pretokenization_seconds": 89.3387330090045,
+    "merge_seconds": 609.261673460991
+  }
+}

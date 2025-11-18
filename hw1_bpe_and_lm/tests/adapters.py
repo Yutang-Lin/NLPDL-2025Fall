@@ -3,12 +3,15 @@ from __future__ import annotations
 import os
 from typing import IO, Any, BinaryIO
 from collections.abc import Iterable
+from collections import Counter
 from jaxtyping import Float, Int
+from multiprocessing import Pool, cpu_count
 
 import numpy.typing as npt
 import torch
 from torch import Tensor
-
+from basics.bpe_helpers import find_chunk_boundaries, pretokenize_chunk
+from basics.tokenizer import Tokenizer
 
 def run_linear(
     d_in: int,
@@ -559,7 +562,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab=vocab, merges=merges, special_tokens=special_tokens)
 
 
 def run_train_bpe(
@@ -589,4 +592,115 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # initialize vocabulary
+    vocab: dict[int, bytes] = {}
+    token_id = 0
+    
+    # add special tokens
+    for special_token in special_tokens:
+        vocab[token_id] = special_token.encode('utf-8')
+        token_id += 1
+    for byte_val in range(256):
+        vocab[token_id] = bytes([byte_val])
+        token_id += 1
+    
+    # do parallel pre-tokenization
+    num_processes = min(cpu_count(), 16)
+    split_tokens = [token.encode("utf-8") for token in special_tokens]
+    pre_token_counts: Counter[tuple[bytes, ...]] = Counter()
+    chunk_args: list[tuple[bytes, list[str]]] = []
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_processes, split_tokens)
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk_args.append((f.read(end - start), special_tokens))
+    if chunk_args:
+        workers = max(1, min(num_processes, len(chunk_args)))
+        if workers == 1:
+            for chunk_bytes, tokens in chunk_args:
+                pre_token_counts.update(pretokenize_chunk(chunk_bytes, tokens))
+        else:
+            with Pool(processes=workers) as pool:
+                for result in pool.starmap(pretokenize_chunk, chunk_args):
+                    pre_token_counts.update(result)
+    
+    # compute BPE merges iteratively
+    merges: list[tuple[bytes, bytes]] = []
+    
+    # represent pre-tokens as list of bytes
+    pre_token_list: list[tuple[list[bytes], int]] = [
+        (list(byte_tuple), count) for byte_tuple, count in pre_token_counts.items()
+    ]
+    
+    # count pairs efficiently using a dictionary
+    pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+    
+    # initialize pair counts
+    for pre_token_bytes, count in pre_token_list:
+        for i in range(len(pre_token_bytes) - 1):
+            pair = (pre_token_bytes[i], pre_token_bytes[i + 1])
+            pair_counts[pair] += count
+    
+    # iteratively merge until we reach vocab_size
+    num_merges_needed = vocab_size - len(vocab)
+    
+    for _ in range(num_merges_needed):
+        if not pair_counts:
+            break
+        
+        # find the most frequent pair, breaking ties lexicographically
+        max_count = max(pair_counts.values())
+        candidates = [pair for pair, count in pair_counts.items() if count == max_count]
+        best_pair = max(candidates)
+        
+        # merge the pair
+        merge_token_1, merge_token_2 = best_pair
+        merged_token = merge_token_1 + merge_token_2
+        
+        # add merged token to vocabulary
+        vocab[token_id] = merged_token
+        token_id += 1
+        merges.append((merge_token_1, merge_token_2))
+        
+        # update pre-tokens and pair counts
+        new_pre_token_list: list[tuple[list[bytes], int]] = []
+        
+        for pre_token_bytes, count in pre_token_list:
+            has_pair = False
+            for i in range(len(pre_token_bytes) - 1):
+                if pre_token_bytes[i] == merge_token_1 and pre_token_bytes[i + 1] == merge_token_2:
+                    has_pair = True
+                    break
+            
+            # check existing tokens whether has pair
+            if not has_pair:
+                new_pre_token_list.append((pre_token_bytes, count))
+                continue
+            
+            # if has pair, update token ids inside this token
+            for i in range(len(pre_token_bytes) - 1):
+                old_pair = (pre_token_bytes[i], pre_token_bytes[i + 1])
+                pair_counts[old_pair] -= count
+                if pair_counts[old_pair] <= 0:
+                    del pair_counts[old_pair]
+            
+            new_pre_token: list[bytes] = []
+            i = 0
+            while i < len(pre_token_bytes):
+                if i < len(pre_token_bytes) - 1 and pre_token_bytes[i] == merge_token_1 and pre_token_bytes[i + 1] == merge_token_2:
+                    new_pre_token.append(merged_token)
+                    i += 2
+                else:
+                    new_pre_token.append(pre_token_bytes[i])
+                    i += 1
+            
+            for i in range(len(new_pre_token) - 1):
+                new_pair = (new_pre_token[i], new_pre_token[i + 1])
+                pair_counts[new_pair] = pair_counts.get(new_pair, 0) + count
+            
+            if new_pre_token:
+                new_pre_token_list.append((new_pre_token, count))
+        
+        pre_token_list = new_pre_token_list
+    
+    return vocab, merges
