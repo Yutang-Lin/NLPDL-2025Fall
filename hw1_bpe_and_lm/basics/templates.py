@@ -380,6 +380,21 @@ class CasualMultiheadSelfAttention(nn.Module):
         attn = scaled_dot_product_attention(q, k, v, causal_mask).transpose(-2, -3).flatten(start_dim=-2, end_dim=-1)
         return self.output_proj(attn)
 
+class PointWiseFFN(nn.Module):
+    """Point-wise feed-forward network."""
+
+    def __init__(self, d_model: int, d_ff: int, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.device = device
+        self.dtype = dtype
+        self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(silu(self.w1(x)))
+
 class TransformerBlock(nn.Module):
     """A single Transformer block with self-attention and feedforward network."""
 
@@ -393,6 +408,7 @@ class TransformerBlock(nn.Module):
         use_rope: bool = False,
         theta: Optional[float] = None,
         max_seq_len: Optional[int] = None,
+        use_point_wise_ffn: bool = False,
     ) -> None:
         """Initializes the Transformer block.
 
@@ -417,7 +433,7 @@ class TransformerBlock(nn.Module):
         self.max_seq_len = max_seq_len
 
         self.attn = CasualMultiheadSelfAttention(d_model, num_heads, use_rope=use_rope, theta=theta, max_seq_len=max_seq_len, device=device, dtype=dtype)
-        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype) if not use_point_wise_ffn else PointWiseFFN(d_model, d_ff, device=device, dtype=dtype)
         self.ln1 = RMSNorm(d_model, eps=1e-5, device=device, dtype=dtype)
         self.ln2 = RMSNorm(d_model, eps=1e-5, device=device, dtype=dtype)
 
@@ -449,6 +465,7 @@ class TransformerLM(nn.Module):
         dtype: Optional[torch.dtype] = None,
         use_rope: bool = False,
         theta: Optional[float] = None,
+        use_point_wise_ffn: bool = False,
     ) -> None:
         """Initializes the Transformer language model.
 
@@ -477,7 +494,7 @@ class TransformerLM(nn.Module):
         self.theta = theta
 
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
-        self.layers = nn.ModuleList([TransformerBlock(d_model, num_heads, d_ff, use_rope=use_rope, theta=theta, max_seq_len=context_length, device=device, dtype=dtype) for _ in range(num_layers)])
+        self.layers = nn.ModuleList([TransformerBlock(d_model, num_heads, d_ff, use_rope=use_rope, theta=theta, max_seq_len=context_length, device=device, dtype=dtype, use_point_wise_ffn=use_point_wise_ffn) for _ in range(num_layers)])
         self.ln_final = RMSNorm(d_model, eps=1e-5, device=device, dtype=dtype)
         self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
 
