@@ -1,8 +1,9 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Iterable, Callable
 from einops import einsum, rearrange
 
 class Linear(nn.Module):
@@ -145,8 +146,8 @@ class SwiGLU(nn.Module):
         """
         super().__init__()
         self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
-        self.w2 = Linear(d_model, d_ff, device=device, dtype=dtype)
-        self.w3 = Linear(d_ff, d_model, device=device, dtype=dtype)
+        self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)
+        self.w3 = Linear(d_model, d_ff, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Applies the SwiGLU transformation.
@@ -249,6 +250,47 @@ def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
     return -log_softmax(inputs, dim=-1).gather(dim=-1, index=targets.unsqueeze(-1)).squeeze().mean()
 
+def sigmoid(x: torch.Tensor) -> torch.Tensor:
+    """Sigmoid activation function.
+    """
+    return 1 / (1 + torch.exp(-x))
+
+def tanh(x: torch.Tensor) -> torch.Tensor:
+    """Hyperbolic tangent activation function.
+    """
+    return (torch.exp(x) - torch.exp(-x)) / (torch.exp(x) + torch.exp(-x))
+
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+    """Clips the gradients of the parameters to have an l2 norm at most max_l2_norm.
+
+    Args:
+        parameters (Iterable[torch.nn.Parameter]): collection of trainable parameters.
+        max_l2_norm (float): a positive value containing the maximum l2-norm.
+
+    The gradients of the parameters (parameter.grad) should be modified in-place.
+    """
+    all_params = torch.cat([param.grad.data.flatten() for param in parameters if param.grad is not None])
+    norm = torch.norm(all_params, p=2)
+    if norm > max_l2_norm and max_l2_norm > 0:
+        for param in parameters:
+            if param.grad is not None:
+                param.grad.data.div_(norm / max_l2_norm)
+
+def get_lr_cosine_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int,
+) -> float:
+    """Returns the learning rate at the given iteration under the specified cosine learning rate schedule with warmup."""
+    if it < warmup_iters:
+        return it / warmup_iters * max_learning_rate
+    elif it <= cosine_cycle_iters:
+        return min_learning_rate + (max_learning_rate - min_learning_rate) / 2 * (1 + np.cos(np.pi * (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)))
+    else:
+        return min_learning_rate
+
 def scaled_dot_product_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -297,7 +339,21 @@ class CasualMultiheadSelfAttention(nn.Module):
             max_seq_len (int, optional): Maximum sequence length for RoPE buffers.
                 Defaults to None.
         """
-        ...
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.use_rope = use_rope
+        self.theta = theta
+        self.max_seq_len = max_seq_len
+        self.device = device
+        self.dtype = dtype
+
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        if use_rope:
+            self.rope = RoPE(theta, d_model // num_heads, max_seq_len, device=device)
 
     def forward(
         self,
@@ -314,7 +370,15 @@ class CasualMultiheadSelfAttention(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (..., seq_len, d_model).
         """
-        ...
+        q = self.q_proj(x).unflatten(dim=-1, sizes=(self.num_heads, -1)).transpose(-2, -3)
+        k = self.k_proj(x).unflatten(dim=-1, sizes=(self.num_heads, -1)).transpose(-2, -3)
+        v = self.v_proj(x).unflatten(dim=-1, sizes=(self.num_heads, -1)).transpose(-2, -3)
+        if self.use_rope:
+            q = self.rope(q, token_positions)
+            k = self.rope(k, token_positions)
+        causal_mask = torch.tril(torch.ones(q.shape[-2], k.shape[-2], device=self.device, dtype=torch.bool))
+        attn = scaled_dot_product_attention(q, k, v, causal_mask).transpose(-2, -3).flatten(start_dim=-2, end_dim=-1)
+        return self.output_proj(attn)
 
 class TransformerBlock(nn.Module):
     """A single Transformer block with self-attention and feedforward network."""
@@ -342,7 +406,20 @@ class TransformerBlock(nn.Module):
             theta (float, optional): Θ parameter for RoPE. Defaults to None.
             max_seq_len (int, optional): Maximum sequence length for RoPE buffers. Defaults to None.
         """
-        ...
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.device = device
+        self.dtype = dtype
+        self.use_rope = use_rope
+        self.theta = theta
+        self.max_seq_len = max_seq_len
+
+        self.attn = CasualMultiheadSelfAttention(d_model, num_heads, use_rope=use_rope, theta=theta, max_seq_len=max_seq_len, device=device, dtype=dtype)
+        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+        self.ln1 = RMSNorm(d_model, eps=1e-5, device=device, dtype=dtype)
+        self.ln2 = RMSNorm(d_model, eps=1e-5, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Applies the Transformer block.
@@ -353,7 +430,9 @@ class TransformerBlock(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (..., seq_len, d_model).
         """
-        ...
+        x = self.attn(self.ln1(x), token_positions=torch.arange(x.shape[-2], device=self.device, dtype=self.dtype) if self.use_rope else None) + x
+        x = self.ffn(self.ln2(x)) + x
+        return x
 
 class TransformerLM(nn.Module):
     """A Transformer-based language model."""
@@ -385,7 +464,22 @@ class TransformerLM(nn.Module):
             use_rope (bool, optional): Whether to apply RoPE. Defaults to False.
             theta (float, optional): Θ parameter for RoPE. Defaults to None.
         """
-        ...
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.device = device
+        self.dtype = dtype
+        self.use_rope = use_rope
+        self.theta = theta
+
+        self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
+        self.layers = nn.ModuleList([TransformerBlock(d_model, num_heads, d_ff, use_rope=use_rope, theta=theta, max_seq_len=context_length, device=device, dtype=dtype) for _ in range(num_layers)])
+        self.ln_final = RMSNorm(d_model, eps=1e-5, device=device, dtype=dtype)
+        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Applies the Transformer language model.
@@ -396,7 +490,11 @@ class TransformerLM(nn.Module):
         Returns:
             torch.Tensor: Logits of shape (..., seq_len, vocab_size).
         """
-        ...
+        x = self.token_embeddings(input_ids)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.ln_final(x)
+        return self.lm_head(x)
 
 class LSTMCell(nn.Module):
     """A single Long Short-Term Memory (LSTM) cell."""
@@ -414,7 +512,10 @@ class LSTMCell(nn.Module):
             device (torch.device, optional): Device to store parameters. Defaults to None.
             dtype (torch.dtype, optional): Data type of parameters. Defaults to None.
         """
-        ...
+        self.weight_ih = nn.Parameter(torch.randn(4 * d_model, d_model, device=device, dtype=dtype))
+        self.weight_hh = nn.Parameter(torch.randn(4 * d_model, d_model, device=device, dtype=dtype))
+        self.bias_ih = nn.Parameter(torch.randn(4 * d_model, device=device, dtype=dtype))
+        self.bias_hh = nn.Parameter(torch.randn(4 * d_model, device=device, dtype=dtype))
 
     def forward(
         self,
@@ -433,7 +534,19 @@ class LSTMCell(nn.Module):
             tuple[torch.Tensor, torch.Tensor]: The next (hidden_state, cell_state),
             each of shape (batch_size, d_model).
         """
-        ...
+        if state is None:
+            h, c = torch.zeros(x.shape[0], self.d_model, device=self.device, dtype=self.dtype), torch.zeros(x.shape[0], self.d_model, device=self.device, dtype=self.dtype)
+        else:
+            h, c = state
+        x = einsum(x, self.weight_ih, "b d_model, 4d_model d_model -> b 4d_model") + self.bias_ih
+        h = einsum(h, self.weight_hh, "b d_model, 4d_model d_model -> b 4d_model") + self.bias_hh
+        i = sigmoid(x[..., :self.d_model])
+        f = sigmoid(x[..., self.d_model:2*self.d_model])
+        o = sigmoid(x[..., 2*self.d_model:3*self.d_model])
+        g = tanh(x[..., 3*self.d_model:])
+        c = f * c + i * g
+        h = o * tanh(c)
+        return h, c
 
 class LSTM(nn.Module):
     """Multi-layer LSTM network with batch-first input."""
@@ -453,7 +566,11 @@ class LSTM(nn.Module):
             device (torch.device, optional): Device to store parameters. Defaults to None.
             dtype (torch.dtype, optional): Data type of parameters. Defaults to None.
         """
-        ...
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.device = device
+        self.dtype = dtype
+        self.cells = nn.ModuleList([LSTMCell(d_model, device=device, dtype=dtype) for _ in range(num_layers)])
 
     def forward(
         self,
@@ -474,7 +591,14 @@ class LSTM(nn.Module):
                 - tuple[torch.Tensor, torch.Tensor]: Next (hidden_states, cell_states),
                     each of shape (num_layers, batch_size, d_model).
         """
-        ...
+        if state is None:
+            h, c = torch.zeros(self.num_layers, x.shape[0], self.d_model, device=self.device, dtype=self.dtype), \
+                    torch.zeros(self.num_layers, x.shape[0], self.d_model, device=self.device, dtype=self.dtype)
+        else:
+            h, c = state
+        for layer in range(self.num_layers):
+            x, (h[layer], c[layer]) = self.cells[layer](x, (h[layer], c[layer]))
+        return x, (h, c)
 
 class LSTMLM(nn.Module):
     """LSTM-based language model."""
@@ -496,7 +620,15 @@ class LSTMLM(nn.Module):
             device (torch.device, optional): Device to store parameters. Defaults to None.
             dtype (torch.dtype, optional): Data type of parameters. Defaults to None.
         """
-        ...
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.device = device
+        self.dtype = dtype
+        self.lstm = LSTM(d_model, num_layers, device=device, dtype=dtype)
+        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
+        self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
 
     def forward(
         self,
@@ -514,4 +646,68 @@ class LSTMLM(nn.Module):
         Returns:
             torch.Tensor: Logits of shape (batch_size, seq_len, vocab_size).
         """
-        ...
+        x = self.token_embeddings(input_ids)
+        x, (h, c) = self.lstm(x, state)
+        logits = self.lm_head(x)
+        return logits, (h, c)
+
+class AdamW(torch.optim.Optimizer):
+    """AdamW optimizer."""
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0):
+        """Initializes the AdamW optimizer."""
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+        for group in self.param_groups:
+            for param in group['params']:
+                self.state[param] = {
+                    'step': 0,
+                    'first_momentum': torch.zeros_like(param),
+                    'second_momentum': torch.zeros_like(param)
+                }
+
+    def step(self, closure: Optional[Callable] = None):
+        """Performs a single optimization step."""
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                state = self.state[p]
+                step = state['step']
+                first_momentum = state['first_momentum'] * group['betas'][0] + (1 - group['betas'][0]) * grad
+                second_momentum = state['second_momentum'] * group['betas'][1] + (1 - group['betas'][1]) * grad * grad
+                
+                step += 1
+                alpha_step = group['lr'] * np.sqrt(1 - group['betas'][1] ** step) / (1 - group['betas'][0] ** step)
+                p.data = p.data - alpha_step * first_momentum / (torch.sqrt(second_momentum) + group['eps']) - group['lr'] * group['weight_decay'] * p.data
+                state['step'] = step
+                state['first_momentum'] = first_momentum
+                state['second_momentum'] = second_momentum
+        return loss
+
+def get_batch(dataset: np.typing.NDArray, batch_size: int, context_length: int, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gets a batch of data from the dataset."""
+    batch = []
+    for _ in range(batch_size):
+        start_idx = np.random.randint(0, len(dataset) - context_length)
+        batch.append(dataset[start_idx:start_idx + context_length + 1])
+    batch = torch.from_numpy(np.array(batch)).long().to(device).clone()
+    return batch[:, :-1], batch[:, 1:]
+
+def save_checkpoint(model, optimizer, iteration, out):
+    """Saves a checkpoint of the model and optimizer."""
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'iteration': iteration
+    }, out)
+
+def load_checkpoint(src, model, optimizer):
+    """Loads a checkpoint of the model and optimizer."""
+    checkpoint = torch.load(src)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return checkpoint['iteration']

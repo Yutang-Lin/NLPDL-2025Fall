@@ -15,8 +15,12 @@ from basics.tokenizer import Tokenizer
 from basics.templates import (
     Linear, Embedding, RMSNorm, SwiGLU,
     RoPE, CasualMultiheadSelfAttention, TransformerBlock, TransformerLM,
-    LSTMCell, LSTM, LSTMLM,
+    LSTMCell, LSTM, LSTMLM, AdamW,
     silu, softmax, cross_entropy, scaled_dot_product_attention,
+    gradient_clipping, get_lr_cosine_schedule, 
+    get_batch, 
+    save_checkpoint,
+    load_checkpoint,
 )
 
 def run_linear(
@@ -148,8 +152,12 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
-
+    causal_multihead_self_attention = CasualMultiheadSelfAttention(d_model, num_heads)
+    causal_multihead_self_attention.q_proj.weight.data = q_proj_weight
+    causal_multihead_self_attention.k_proj.weight.data = k_proj_weight
+    causal_multihead_self_attention.v_proj.weight.data = v_proj_weight
+    causal_multihead_self_attention.output_proj.weight.data = o_proj_weight
+    return causal_multihead_self_attention(in_features)
 
 def run_multihead_self_attention_with_rope(
     d_model: int,
@@ -188,8 +196,12 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
-
+    causal_multihead_self_attention = CasualMultiheadSelfAttention(d_model, num_heads, use_rope=True, theta=theta, max_seq_len=max_seq_len)
+    causal_multihead_self_attention.q_proj.weight.data = q_proj_weight
+    causal_multihead_self_attention.k_proj.weight.data = k_proj_weight
+    causal_multihead_self_attention.v_proj.weight.data = v_proj_weight
+    causal_multihead_self_attention.output_proj.weight.data = o_proj_weight
+    return causal_multihead_self_attention(in_features, token_positions)
 
 def run_rope(
     d_k: int,
@@ -284,7 +296,12 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    transformer_block = TransformerBlock(d_model, num_heads, d_ff, 
+                                         use_rope=True,
+                                         max_seq_len=max_seq_len,
+                                         theta=theta,)
+    transformer_block.load_state_dict(weights, strict=False)
+    return transformer_block(in_features)
 
 
 def run_transformer_lm(
@@ -366,7 +383,10 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer_lm = TransformerLM(vocab_size, context_length, num_layers, d_model, num_heads, d_ff, 
+                                   use_rope=True, theta=rope_theta)
+    transformer_lm.load_state_dict(weights, strict=False)
+    return transformer_lm(in_indices)
 
 
 def run_rmsnorm(
@@ -428,7 +448,7 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    return get_batch(dataset, batch_size, context_length, device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -474,14 +494,14 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -509,7 +529,7 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return get_lr_cosine_schedule(it, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters)
 
 
 def run_save_checkpoint(
@@ -528,7 +548,7 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    save_checkpoint(model, optimizer, iteration, out)
 
 
 def run_load_checkpoint(
@@ -549,7 +569,7 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    return load_checkpoint(src, model, optimizer)
 
 
 def get_tokenizer(

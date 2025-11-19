@@ -64,7 +64,7 @@ class Tokenizer:
             tokens = new_tokens
         return tokens
 
-    def encode(self, text: str, verbose: bool = True) -> list[int]:
+    def encode(self, text: str, verbose: bool = False) -> list[int]:
         if not text:
             return []
         
@@ -137,6 +137,21 @@ class Tokenizer:
     def decode(self, ids: list[int]) -> str:
         text_bytes = b"".join([self.vocab[id] for id in ids])
         return text_bytes.decode("utf-8", errors="replace")
+
+def test_maximum_speed():
+    tokenizer = Tokenizer.from_files(
+        vocab_filepath="outputs/tokenizer/tinystories_10k/vocab.json",
+        merges_filepath="outputs/tokenizer/tinystories_10k/merges.txt",
+        special_tokens=["<|endoftext|>"],
+    )
+    with open("data/TinyStoriesV2-GPT4-valid.txt", "r") as f:
+        data = f.read()
+    start_time = time.perf_counter()
+    ids = tokenizer.encode(data[:10000], verbose=True)
+    end_time = time.perf_counter()
+    num_bytes = data[:10000].encode("utf-8")
+    print(f"Time taken to encode validation dataset: {end_time - start_time} seconds")
+    print(f"Speed for validation dataset: {len(num_bytes) / (end_time - start_time)} bytes/second")
 
 def encode_tiny_stories(num_processes: int):
     tokenizer = Tokenizer.from_files(
@@ -214,4 +229,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-processes", type=int, default=16)
     args = parser.parse_args()
+    test_maximum_speed()
     encode_tiny_stories(args.num_processes)
