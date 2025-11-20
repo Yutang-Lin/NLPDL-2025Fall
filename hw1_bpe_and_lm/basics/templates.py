@@ -207,7 +207,7 @@ class RoPE(nn.Module):
         
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
-        
+    
         rotated_x1 = x1 * cos - x2 * sin
         rotated_x2 = x1 * sin + x2 * cos
         
@@ -260,7 +260,7 @@ def tanh(x: torch.Tensor) -> torch.Tensor:
     """
     return (torch.exp(x) - torch.exp(-x)) / (torch.exp(x) + torch.exp(-x))
 
-def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> torch.Tensor:
     """Clips the gradients of the parameters to have an l2 norm at most max_l2_norm.
 
     Args:
@@ -275,6 +275,44 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
         for param in parameters:
             if param.grad is not None:
                 param.grad.data.div_(norm / max_l2_norm)
+    return norm
+
+
+def _apply_temperature_top_p(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+) -> torch.Tensor:
+    if temperature <= 0:
+        return torch.nn.functional.one_hot(
+            logits.argmax(dim=-1), num_classes=logits.shape[-1]
+        ).to(dtype=logits.dtype)
+    scaled_logits = logits / temperature
+    probs = torch.softmax(scaled_logits, dim=-1)
+    if top_p < 1.0:
+        top_p = max(top_p, 1e-5)
+        sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        mask = (cumulative - sorted_probs) >= top_p
+        sorted_probs = sorted_probs.masked_fill(mask, 0.0)
+        probs = torch.zeros_like(probs)
+        probs.scatter_(dim=-1, index=sorted_indices, src=sorted_probs)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+    return probs
+
+
+def sample_next_token(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+) -> torch.Tensor:
+    with torch.no_grad():
+        probs = _apply_temperature_top_p(logits, temperature, top_p)
+        if temperature <= 0:
+            token_ids = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            token_ids = torch.multinomial(probs, num_samples=1)
+    return token_ids
 
 def get_lr_cosine_schedule(
     it: int,
@@ -374,6 +412,9 @@ class CasualMultiheadSelfAttention(nn.Module):
         k = self.k_proj(x).unflatten(dim=-1, sizes=(self.num_heads, -1)).transpose(-2, -3)
         v = self.v_proj(x).unflatten(dim=-1, sizes=(self.num_heads, -1)).transpose(-2, -3)
         if self.use_rope:
+            if token_positions is None:
+                token_positions = torch.arange(q.shape[-2], device=self.device, dtype=torch.long)
+                token_positions = token_positions.expand(*q.shape[:-1])
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
         causal_mask = torch.tril(torch.ones(q.shape[-2], k.shape[-2], device=self.device, dtype=torch.bool))
@@ -446,7 +487,7 @@ class TransformerBlock(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (..., seq_len, d_model).
         """
-        x = self.attn(self.ln1(x), token_positions=torch.arange(x.shape[-2], device=self.device, dtype=self.dtype) if self.use_rope else None) + x
+        x = self.attn(self.ln1(x)) + x
         x = self.ffn(self.ln2(x)) + x
         return x
 
@@ -513,6 +554,33 @@ class TransformerLM(nn.Module):
         x = self.ln_final(x)
         return self.lm_head(x)
 
+    @torch.no_grad()
+    def decode(
+        self,
+        input_ids: torch.Tensor | list[int],
+        max_new_tokens: int = 50,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        eos_token_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        self.eval()
+        device = self.token_embeddings.weight.device
+        if isinstance(input_ids, list):
+            input_ids = torch.tensor(input_ids, dtype=torch.long, device=device)
+        input_tensor = input_ids.to(device)
+        if input_tensor.dim() == 1:
+            input_tensor = input_tensor.unsqueeze(0)
+        generated = input_tensor
+        for _ in range(max_new_tokens):
+            context = generated[:, -self.context_length :]
+            logits = self(context)
+            next_logits = logits[:, -1, :]
+            next_token = sample_next_token(next_logits, temperature, top_p)
+            generated = torch.cat([generated, next_token], dim=1)
+            if eos_token_id is not None and torch.all(next_token.squeeze(-1) == eos_token_id):
+                break
+        return generated
+
 class LSTMCell(nn.Module):
     """A single Long Short-Term Memory (LSTM) cell."""
 
@@ -529,6 +597,10 @@ class LSTMCell(nn.Module):
             device (torch.device, optional): Device to store parameters. Defaults to None.
             dtype (torch.dtype, optional): Data type of parameters. Defaults to None.
         """
+        super().__init__()
+        self.d_model = d_model
+        self.device = device
+        self.dtype = dtype
         self.weight_ih = nn.Parameter(torch.randn(4 * d_model, d_model, device=device, dtype=dtype))
         self.weight_hh = nn.Parameter(torch.randn(4 * d_model, d_model, device=device, dtype=dtype))
         self.bias_ih = nn.Parameter(torch.randn(4 * d_model, device=device, dtype=dtype))
@@ -555,8 +627,8 @@ class LSTMCell(nn.Module):
             h, c = torch.zeros(x.shape[0], self.d_model, device=self.device, dtype=self.dtype), torch.zeros(x.shape[0], self.d_model, device=self.device, dtype=self.dtype)
         else:
             h, c = state
-        x = einsum(x, self.weight_ih, "b d_model, 4d_model d_model -> b 4d_model") + self.bias_ih
-        h = einsum(h, self.weight_hh, "b d_model, 4d_model d_model -> b 4d_model") + self.bias_hh
+        x = einsum(x, self.weight_ih, "b d_model, dddd_model d_model -> b dddd_model") + self.bias_ih
+        h = einsum(h, self.weight_hh, "b d_model, dddd_model d_model -> b dddd_model") + self.bias_hh
         i = sigmoid(x[..., :self.d_model])
         f = sigmoid(x[..., self.d_model:2*self.d_model])
         o = sigmoid(x[..., 2*self.d_model:3*self.d_model])
@@ -583,10 +655,12 @@ class LSTM(nn.Module):
             device (torch.device, optional): Device to store parameters. Defaults to None.
             dtype (torch.dtype, optional): Data type of parameters. Defaults to None.
         """
+        super().__init__()
         self.d_model = d_model
         self.num_layers = num_layers
         self.device = device
         self.dtype = dtype
+        self.lns = nn.ModuleList([RMSNorm(d_model, eps=1e-6, device=device, dtype=dtype) for _ in range(num_layers)])
         self.cells = nn.ModuleList([LSTMCell(d_model, device=device, dtype=dtype) for _ in range(num_layers)])
 
     def forward(
@@ -609,13 +683,22 @@ class LSTM(nn.Module):
                     each of shape (num_layers, batch_size, d_model).
         """
         if state is None:
-            h, c = torch.zeros(self.num_layers, x.shape[0], self.d_model, device=self.device, dtype=self.dtype), \
-                    torch.zeros(self.num_layers, x.shape[0], self.d_model, device=self.device, dtype=self.dtype)
+            h = torch.zeros(self.num_layers, x.shape[0], self.d_model, device=self.device, dtype=self.dtype)
+            c = torch.zeros(self.num_layers, x.shape[0], self.d_model, device=self.device, dtype=self.dtype)
         else:
             h, c = state
-        for layer in range(self.num_layers):
-            x, (h[layer], c[layer]) = self.cells[layer](x, (h[layer], c[layer]))
-        return x, (h, c)
+        result_output = []
+        h_new = [h[layer] for layer in range(self.num_layers)]
+        c_new = [c[layer] for layer in range(self.num_layers)]
+        for t in range(x.shape[1]):
+            x_t = x[:, t]
+            for layer in range(self.num_layers):
+                h_layer, c_layer = self.cells[layer](x_t, (h_new[layer], c_new[layer]))
+                x_t = self.lns[layer](h_layer)
+                h_new[layer] = h_layer
+                c_new[layer] = c_layer
+            result_output.append(x_t)
+        return torch.stack(result_output, dim=1), (torch.stack(h_new, dim=0), torch.stack(c_new, dim=0))
 
 class LSTMLM(nn.Module):
     """LSTM-based language model."""
@@ -644,6 +727,7 @@ class LSTMLM(nn.Module):
         self.device = device
         self.dtype = dtype
         self.lstm = LSTM(d_model, num_layers, device=device, dtype=dtype)
+        self.ln_final = RMSNorm(d_model, eps=1e-5, device=device, dtype=dtype)
         self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
 
@@ -665,8 +749,40 @@ class LSTMLM(nn.Module):
         """
         x = self.token_embeddings(input_ids)
         x, (h, c) = self.lstm(x, state)
-        logits = self.lm_head(x)
+        logits = self.lm_head(self.ln_final(x))
         return logits, (h, c)
+
+    @torch.no_grad()
+    def decode(
+        self,
+        input_ids: torch.Tensor | list[int],
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        max_new_tokens: int = 50,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        eos_token_id: Optional[int] = None,
+        return_state: bool = False,
+    ) -> torch.Tensor:
+        self.eval()
+        device = self.token_embeddings.weight.device
+        if isinstance(input_ids, list):
+            input_ids = torch.tensor(input_ids, dtype=torch.long, device=device)
+        input_tensor = input_ids.to(device)
+        if input_tensor.dim() == 1:
+            input_tensor = input_tensor.unsqueeze(0)
+        generated = input_tensor
+        logits, state = self(generated, state)
+        for _ in range(max_new_tokens):
+            next_logits = logits[:, -1, :]
+            next_token = sample_next_token(next_logits, temperature, top_p)
+            generated = torch.cat([generated, next_token], dim=1)
+            if eos_token_id is not None and torch.all(next_token.squeeze(-1) == eos_token_id):
+                break
+            logits, state = self(next_token, state)
+        if return_state:
+            return generated, state
+        else:
+            return generated
 
 class AdamW(torch.optim.Optimizer):
     """AdamW optimizer."""
@@ -722,9 +838,10 @@ def save_checkpoint(model, optimizer, iteration, out):
         'iteration': iteration
     }, out)
 
-def load_checkpoint(src, model, optimizer):
+def load_checkpoint(src, model, optimizer=None):
     """Loads a checkpoint of the model and optimizer."""
-    checkpoint = torch.load(src)
+    checkpoint = torch.load(src, map_location='cpu', weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     return checkpoint['iteration']
