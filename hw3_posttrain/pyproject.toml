@@ -6,8 +6,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "accelerate>=1.5.2",
-    "alpaca-eval",
-    "flash-attn==2.7.4.post1",
     "jupyter>=1.1.1",
     "math-verify[antlr4-13-2]>=0.7.0",
     "pylatexenc==2.10",
@@ -25,10 +23,6 @@ dependencies = [
 [tool.uv]
 package = true
 no-build-isolation-package = ["flash-attn"]
-
-
-[tool.uv.sources]
-alpaca-eval = { git = "https://github.com/nelson-liu/alpaca_eval.git", rev = "forward_kwargs_to_vllm" }
 
 [tool.pytest.ini_options]
 log_cli = true
